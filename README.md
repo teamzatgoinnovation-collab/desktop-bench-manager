@@ -47,6 +47,7 @@ Login uses the same token as the web Bench Manager.
 | `BENCH_MANAGER_PORT` | Port when spawning Next (default `3008`) |
 | `BENCH_MANAGER_WEB` | Absolute path to `Clients/web/bench-manager` |
 | `WORKSPACE_ROOT` | WorkSpace root (resolves `Clients/web/bench-manager`) |
+| `NODE_BINARY` | Absolute path to Node.js (required if PATH/`node` is wrong; never use Electron’s binary) |
 
 If something is already listening on 3008, the desktop attaches without spawning a second server.
 

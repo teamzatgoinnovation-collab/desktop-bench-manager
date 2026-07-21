@@ -5,7 +5,7 @@ import {
   ipcMain,
   shell,
 } from "electron";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -14,11 +14,12 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_PORT = 3008;
-const DEFAULT_URL = `http://127.0.0.1:${DEFAULT_PORT}`;
 
 let mainWindow: BrowserWindow | null = null;
 let benchChild: ChildProcess | null = null;
 let spawnedByUs = false;
+let benchReady = false;
+let lastBenchStderr = "";
 
 function benchPort(): number {
   const raw = process.env.BENCH_MANAGER_PORT?.trim();
@@ -46,6 +47,40 @@ function resolveBenchWebRoot(): string {
   }
   // dist-electron → package → desktop → Clients → web/bench-manager
   return path.resolve(__dirname, "../../../web/bench-manager");
+}
+
+/** Never use process.execPath inside Electron — that is the Electron binary. */
+function resolveNodeBinary(): string {
+  const fromEnv = process.env.NODE_BINARY?.trim();
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+
+  const execPath = process.execPath;
+  const looksLikeElectron =
+    /electron/i.test(execPath) || process.versions.electron !== undefined;
+
+  if (!looksLikeElectron && fs.existsSync(execPath)) {
+    return execPath;
+  }
+
+  for (const candidate of ["/usr/local/bin/node", "/usr/bin/node"]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  try {
+    const which = execFileSync("command", ["-v", "node"], {
+      encoding: "utf8",
+      env: process.env,
+    })
+      .trim()
+      .split("\n")[0];
+    if (which && !/electron/i.test(which)) return which;
+  } catch {
+    // fall through
+  }
+
+  throw new Error(
+    "Could not find a Node.js binary to start Next.js. Set NODE_BINARY to your node path.",
+  );
 }
 
 function probeUrl(url: string, timeoutMs = 1500): Promise<boolean> {
@@ -83,6 +118,7 @@ function spawnBenchServer(webRoot: string): ChildProcess {
     );
   }
 
+  const nodeBin = resolveNodeBinary();
   const args = useProd
     ? [nextBin, "start", "--port", port]
     : [nextBin, "dev", "--port", port];
@@ -92,19 +128,24 @@ function spawnBenchServer(webRoot: string): ChildProcess {
   delete env.VERCEL_ENV;
   delete env.VERCEL_REGION;
   delete env.AWS_LAMBDA_FUNCTION_NAME;
+  delete env.ELECTRON_RUN_AS_NODE;
 
-  const child = spawn(process.execPath, args, {
+  lastBenchStderr = "";
+  const child = spawn(nodeBin, args, {
     cwd: webRoot,
     env,
     stdio: ["ignore", "pipe", "pipe"],
-    detached: process.platform !== "win32",
+    // Keep attached so we can kill cleanly; detached was unnecessary.
+    detached: false,
   });
 
   child.stdout?.on("data", (buf: Buffer) => {
     process.stdout.write(`[bench-web] ${buf.toString()}`);
   });
   child.stderr?.on("data", (buf: Buffer) => {
-    process.stderr.write(`[bench-web] ${buf.toString()}`);
+    const text = buf.toString();
+    lastBenchStderr = `${lastBenchStderr}${text}`.slice(-4000);
+    process.stderr.write(`[bench-web] ${text}`);
   });
 
   return child;
@@ -114,6 +155,7 @@ async function ensureBenchServer(): Promise<{ url: string; error?: string }> {
   const url = benchUrl();
   if (await probeUrl(url)) {
     spawnedByUs = false;
+    benchReady = true;
     return { url };
   }
 
@@ -134,41 +176,47 @@ async function ensureBenchServer(): Promise<{ url: string; error?: string }> {
     };
   }
   spawnedByUs = true;
+  benchReady = false;
 
-  benchChild.on("exit", (code) => {
-    if (spawnedByUs && mainWindow && !mainWindow.isDestroyed()) {
+  benchChild.on("exit", (code, signal) => {
+    const wasReady = benchReady;
+    benchChild = null;
+    if (!spawnedByUs) return;
+    if (wasReady && mainWindow && !mainWindow.isDestroyed()) {
       void dialog.showMessageBox(mainWindow, {
         type: "error",
         title: "Bench Manager",
-        message: `Next.js server exited (code ${code ?? "?"}).`,
+        message: `Next.js server exited (code ${code ?? "null"}, signal ${signal ?? "none"}).`,
+        detail: lastBenchStderr.trim() || undefined,
       });
     }
-    benchChild = null;
   });
 
   const ready = await waitForUrl(url);
   if (!ready) {
+    const detail = lastBenchStderr.trim();
+    stopBenchServer();
     return {
       url,
-      error: `Timed out waiting for ${url}. Check Clients/web/bench-manager (.env.local, pnpm install).`,
+      error: detail
+        ? `Timed out waiting for ${url}.\n\n${detail}`
+        : `Timed out waiting for ${url}. Check Clients/web/bench-manager (.env.local, pnpm install).`,
     };
   }
+  benchReady = true;
   return { url };
 }
 
 function stopBenchServer() {
-  if (!spawnedByUs || !benchChild || benchChild.killed) return;
+  if (!spawnedByUs || !benchChild) return;
   const child = benchChild;
   spawnedByUs = false;
+  benchReady = false;
   benchChild = null;
   try {
-    if (process.platform === "win32") {
-      spawn("taskkill", ["/pid", String(child.pid), "/f", "/t"]);
-    } else if (child.pid) {
-      process.kill(-child.pid, "SIGTERM");
-    }
-  } catch {
     child.kill("SIGTERM");
+  } catch {
+    // ignore
   }
 }
 
