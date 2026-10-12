@@ -32,7 +32,7 @@ Configure Cloud SSH in the web app’s Settings (or `Clients/web/bench-manager/.
 
 ```bash
 BENCH_MANAGER_TOKEN=…
-DO_SSH_HOST=157.230.8.164
+DO_SSH_HOST=2.29.17.8
 DO_SSH_USER=root
 DO_SSH_KEY_PATH=/home/YOU/.ssh/id_ed25519
 ```
